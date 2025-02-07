@@ -1333,7 +1333,7 @@ impl Player {
 
             self.send_sign_packet(block, final_block_pos, face).await;
             // Block was placed successfully, decrement inventory
-            return Ok(true)
+            return Ok(true);
         }
 
         Ok(false)
