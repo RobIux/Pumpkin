@@ -22,7 +22,7 @@ impl ItemEntity {
         let slot = Slot::from(stack);
         Self {
             entity,
-            id: stack.item_id,
+            id: stack.item.id,
             count: stack.item_count,
             item: slot,
             pickup_delay: AtomicI8::new(10), // Vanilla
@@ -30,7 +30,7 @@ impl ItemEntity {
     }
     pub async fn send_meta_packet(&self) {
         self.entity
-            .send_meta_data(Metadata::new(8, MetaDataType::ItemStack, self.item.clone()))
+            .send_meta_data(Metadata::new(8, MetaDataType::ItemStack, &self.item))
             .await;
     }
 }

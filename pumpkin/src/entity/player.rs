@@ -13,6 +13,8 @@ use pumpkin_config::{ADVANCED_CONFIG, BASIC_CONFIG};
 use pumpkin_data::{
     damage::DamageType,
     entity::EntityType,
+    item::Operation,
+    particle::Particle,
     sound::{Sound, SoundCategory},
 };
 use pumpkin_inventory::player::PlayerInventory;
@@ -21,9 +23,9 @@ use pumpkin_protocol::{
     bytebuf::packet::Packet,
     client::play::{
         CActionBar, CCombatDeath, CDisguisedChatMessage, CEntityStatus, CGameEvent, CHurtAnimation,
-        CKeepAlive, CPlayDisconnect, CPlayerAbilities, CPlayerInfoUpdate, CPlayerPosition,
-        CSetExperience, CSetHealth, CSubtitle, CSystemChatMessage, CTitleText, GameEvent,
-        MetaDataType, PlayerAction,
+        CKeepAlive, CParticle, CPlayDisconnect, CPlayerAbilities, CPlayerInfoUpdate,
+        CPlayerPosition, CRespawn, CSetExperience, CSetHealth, CSubtitle, CSystemChatMessage,
+        CTitleText, CUnloadChunk, GameEvent, MetaDataType, PlayerAction,
     },
     server::play::{
         SChatCommand, SChatMessage, SClientCommand, SClientInformationPlay, SClientTickEnd,
@@ -57,20 +59,14 @@ use pumpkin_util::{
     text::TextComponent,
     GameMode,
 };
-use pumpkin_world::{
-    cylindrical_chunk_iterator::Cylindrical,
-    item::{
-        registry::{get_item_by_id, Operation},
-        ItemStack,
-    },
-};
+use pumpkin_world::{cylindrical_chunk_iterator::Cylindrical, item::ItemStack};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 use super::{
     combat::{self, player_attack_sound, AttackType},
     hunger::HungerManager,
     item::ItemEntity,
-    Entity, EntityId, NBTStorage,
+    Entity, EntityBase, EntityId, NBTStorage,
 };
 use crate::{
     command::{client_suggestions, dispatcher::CommandDispatcher},
@@ -238,10 +234,10 @@ impl Player {
     /// Removes the Player out of the current World
     #[allow(unused_variables)]
     pub async fn remove(self: Arc<Self>) {
-        let world = self.world();
+        let world = self.world().await;
         self.cancel_tasks.notify_waiters();
 
-        world.remove_player(self.clone()).await;
+        world.remove_player(self.clone(), true).await;
 
         let cylindrical = self.watched_section.load();
 
@@ -276,9 +272,10 @@ impl Player {
         //self.world().level.list_cached();
     }
 
-    pub async fn attack(&self, victim: &Arc<Self>) {
-        let world = self.world();
-        let victim_entity = &victim.living_entity.entity;
+    pub async fn attack(&self, victim: Arc<dyn EntityBase>) {
+        let world = self.world().await;
+        let victim_entity = victim.get_entity();
+        let victim_living_entity = victim.get_living_entity();
         let attacker_entity = &self.living_entity.entity;
         let config = &ADVANCED_CONFIG.pvp;
 
@@ -294,17 +291,15 @@ impl Player {
 
         // get attack damage
         if let Some(item_stack) = item_slot {
-            if let Some(item) = get_item_by_id(item_stack.item_id) {
-                // TODO: this should be cached in memory
-                if let Some(modifiers) = &item.components.attribute_modifiers {
-                    for item_mod in &modifiers.modifiers {
-                        if item_mod.operation == Operation::AddValue {
-                            if item_mod.id == "minecraft:base_attack_damage" {
-                                add_damage = item_mod.amount;
-                            }
-                            if item_mod.id == "minecraft:base_attack_speed" {
-                                add_speed = item_mod.amount;
-                            }
+            // TODO: this should be cached in memory
+            if let Some(modifiers) = &item_stack.item.components.attribute_modifiers {
+                for item_mod in modifiers.modifiers {
+                    if item_mod.operation == Operation::AddValue {
+                        if item_mod.id == "minecraft:base_attack_damage" {
+                            add_damage = item_mod.amount;
+                        }
+                        if item_mod.id == "minecraft:base_attack_speed" {
+                            add_speed = item_mod.amount;
                         }
                     }
                 }
@@ -328,17 +323,17 @@ impl Player {
 
         let pos = victim_entity.pos.load();
 
-        if (config.protect_creative && victim.gamemode.load() == GameMode::Creative)
-            || !victim.living_entity.check_damage(damage as f32)
-        {
-            world
-                .play_sound(
-                    Sound::EntityPlayerAttackNodamage,
-                    SoundCategory::Players,
-                    &pos,
-                )
-                .await;
-            return;
+        if let Some(living) = victim_living_entity {
+            if !living.check_damage(damage as f32) {
+                world
+                    .play_sound(
+                        Sound::EntityPlayerAttackNodamage,
+                        SoundCategory::Players,
+                        &pos,
+                    )
+                    .await;
+                return;
+            }
         }
 
         world
@@ -347,28 +342,29 @@ impl Player {
 
         let attack_type = AttackType::new(self, attack_cooldown_progress as f32).await;
 
-        player_attack_sound(&pos, world, attack_type).await;
+        player_attack_sound(&pos, &world, attack_type).await;
 
         if matches!(attack_type, AttackType::Critical) {
             damage *= 1.5;
         }
 
-        victim
-            .living_entity
-            .damage(damage as f32, DamageType::PLAYER_ATTACK)
-            .await;
+        if let Some(living) = victim_living_entity {
+            living
+                .damage(damage as f32, DamageType::PLAYER_ATTACK)
+                .await;
+        }
 
         let mut knockback_strength = 1.0;
         match attack_type {
             AttackType::Knockback => knockback_strength += 1.0,
             AttackType::Sweeping => {
-                combat::spawn_sweep_particle(attacker_entity, world, &pos).await;
+                combat::spawn_sweep_particle(attacker_entity, &world, &pos).await;
             }
             _ => {}
         };
 
         if config.knockback {
-            combat::handle_knockback(attacker_entity, victim, victim_entity, knockback_strength)
+            combat::handle_knockback(attacker_entity, &world, victim_entity, knockback_strength)
                 .await;
         }
 
@@ -388,6 +384,28 @@ impl Player {
             TitleMode::SubTitle => self.client.send_packet(&CSubtitle::new(text)).await,
             TitleMode::ActionBar => self.client.send_packet(&CActionBar::new(text)).await,
         }
+    }
+
+    pub async fn spawn_particle(
+        &self,
+        position: Vector3<f64>,
+        offset: Vector3<f32>,
+        max_speed: f32,
+        particle_count: i32,
+        pariticle: Particle,
+    ) {
+        self.client
+            .send_packet(&CParticle::new(
+                false,
+                false,
+                position,
+                offset,
+                max_speed,
+                particle_count,
+                VarInt(pariticle as i32),
+                &[],
+            ))
+            .await;
     }
 
     pub async fn play_sound(
@@ -504,8 +522,8 @@ impl Player {
         self.living_entity.entity.entity_id
     }
 
-    pub const fn world(&self) -> &Arc<World> {
-        &self.living_entity.entity.world
+    pub async fn world(&self) -> Arc<World> {
+        self.living_entity.entity.world.read().await.clone()
     }
 
     pub fn position(&self) -> Vector3<f64> {
@@ -580,6 +598,93 @@ impl Player {
                 .send_packet(&entity.get_entity().create_spawn_packet())
                 .await;
         }
+    }
+
+    async fn unload_watched_chunks(&self, world: &World) {
+        let radial_chunks = self.watched_section.load().all_chunks_within();
+        let level = &world.level;
+        let chunks_to_clean = level.mark_chunks_as_not_watched(&radial_chunks);
+        level.clean_chunks(&chunks_to_clean).await;
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            for chunk in chunks_to_clean {
+                if client.closed.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                client
+                    .send_packet(&CUnloadChunk::new(chunk.x, chunk.z))
+                    .await;
+            }
+        });
+        self.watched_section.store(Cylindrical::new(
+            Vector2::new(i32::MAX >> 1, i32::MAX >> 1),
+            unsafe { NonZeroU8::new_unchecked(1) },
+        ));
+    }
+
+    /// Teleports the player to a different world or dimension with an optional position, yaw, and pitch.
+    pub async fn teleport_world(
+        self: Arc<Self>,
+        new_world: Arc<World>,
+        position: Option<Vector3<f64>>,
+        yaw: Option<f32>,
+        pitch: Option<f32>,
+    ) {
+        self.set_client_loaded(false);
+        let current_world = self.living_entity.entity.world.read().await.clone();
+        let uuid = self.gameprofile.id;
+        current_world.remove_player(self.clone(), false).await;
+        *self.living_entity.entity.world.write().await = new_world.clone();
+        new_world.players.lock().await.insert(uuid, self.clone());
+        self.unload_watched_chunks(&current_world).await;
+        let last_pos = self.living_entity.last_pos.load();
+        let death_dimension = self.world().await.dimension_type.name();
+        let death_location = BlockPos(Vector3::new(
+            last_pos.x.round() as i32,
+            last_pos.y.round() as i32,
+            last_pos.z.round() as i32,
+        ));
+        self.client
+            .send_packet(&CRespawn::new(
+                (new_world.dimension_type as u8).into(),
+                new_world.dimension_type.name(),
+                0, // seed
+                self.gamemode.load() as u8,
+                self.gamemode.load() as i8,
+                false,
+                false,
+                Some((death_dimension, death_location)),
+                0.into(),
+                0.into(),
+                1,
+            ))
+            .await;
+        self.send_abilities_update().await;
+        self.send_permission_lvl_update().await;
+        let info = &new_world.level.level_info;
+        let position = if let Some(pos) = position {
+            pos
+        } else {
+            Vector3::new(
+                f64::from(info.spawn_x),
+                f64::from(
+                    new_world
+                        .get_top_block(Vector2::new(
+                            f64::from(info.spawn_x) as i32,
+                            f64::from(info.spawn_x) as i32,
+                        ))
+                        .await
+                        + 1,
+                ),
+                f64::from(info.spawn_z),
+            )
+        };
+        let yaw = yaw.unwrap_or(info.spawn_angle);
+        let pitch = pitch.unwrap_or(10.0);
+        self.request_teleport(position, yaw, pitch).await;
+        self.living_entity.last_pos.store(position);
+
+        new_world.send_world_info(&self, position, yaw, pitch).await;
     }
 
     /// Yaw and Pitch in degrees
@@ -732,6 +837,8 @@ impl Player {
         self.living_entity
             .entity
             .world
+            .read()
+            .await
             .broadcast_packet_all(&CPlayerInfoUpdate::new(
                 0x04,
                 &[pumpkin_protocol::client::play::Player {
@@ -790,10 +897,10 @@ impl Player {
             let entity = server.add_entity(
                 self.living_entity.entity.pos.load(),
                 EntityType::ITEM,
-                self.world(),
+                &self.world().await,
             );
             let item_entity = Arc::new(ItemEntity::new(entity, &item.clone()));
-            self.world().spawn_entity(item_entity.clone()).await;
+            self.world().await.spawn_entity(item_entity.clone()).await;
             item_entity.send_meta_packet().await;
             // decrase item in hotbar
             inv.decrease_current_stack(1);
@@ -917,6 +1024,17 @@ impl NBTStorage for Player {
         self.experience_level.store(level, Ordering::Relaxed);
         self.experience_progress.store(progress);
         self.experience_points.store(points, Ordering::Relaxed);
+    }
+}
+
+#[async_trait]
+impl EntityBase for Player {
+    fn get_entity(&self) -> &Entity {
+        &self.living_entity.entity
+    }
+
+    fn get_living_entity(&self) -> Option<&LivingEntity> {
+        Some(&self.living_entity)
     }
 }
 
